@@ -1,0 +1,101 @@
+# ============================================================
+# Prediction Market Agent —— 主配置
+# 数据接入 + 分析框架 + Agent 判断层，全部阈值集中于此
+# ============================================================
+
+runtime:
+  # 启用的数据源（polymarket / kalshi）
+  platforms: [polymarket, kalshi]
+  # 检索关键词：以 A 股外部驱动（地缘 / 宏观 / 金融）为主
+  keywords:
+    - Iran
+    - China
+    - tariff
+    - war
+    - ceasefire
+    - sanctions
+    - Fed
+    - interest rate
+    - recession
+    - oil
+    - Taiwan
+    - Russia
+  min_volume: 10000        # 最小累计成交额（USD），过滤长尾死盘
+  min_liquidity: 1         # 最小挂单流动性（USD），>0 剔除已结算/无盘口
+  # 按平台覆盖上述阈值：Kalshi 成交额是「合约数×概率」估计值，量级天然偏小
+  per_source:
+    kalshi:
+      min_volume: 2000
+  # 截断时为每个平台保底的市场数：防止 Kalshi（成交额估计量级小）被 Polymarket 淹没
+  min_per_platform: 20
+  max_days_to_expiry: 400  # 只保留 N 天内结算的市场（剔除超长周期噱头盘与历史盘）
+  top_n_per_keyword: 25    # 每个关键词检索的 event 数
+  # 剔除美国国内州级选举盘（参/众议员、州长等），保留总统大选等全国性事件
+  exclude_us_state_elections: true
+  # 剔除各国次国家级选举（任何国家的市长/地方议会/省长盘，台北市长选举等）
+  exclude_local_elections: true
+  # 关键词相关性门禁：搜回来的必须本地命中关键词/政经分类（体育娱乐奖项无条件剔除）
+  require_keyword_match: true
+  enrich_top_n: 12         # 对成交额前 N 的市场做概率历史/持仓增强
+  limit: 300               # 全局保留市场数上限
+  # 建议层门槛：24h 成交额低于此值不配出建议（防噱头盘/死盘）；
+  # low 桶不再接受尾概率（概率低于此 % 的彩票合约无交易含义）
+  suggest_min_volume_24h: 500
+  suggest_tail_prob_floor: 2.0
+
+data_sources:
+  polymarket:
+    gamma_base: https://gamma-api.polymarket.com
+    clob_base: https://clob.polymarket.com
+    data_base: https://data-api.polymarket.com
+  kalshi:
+    # 2026 Q1 生产域名迁移至 external-api；公开端点无需认证
+    # 注意：/markets 的 query 参数实测被忽略，服务端关键词检索不可用；
+    # 取数靠下面的分段扫描，精筛靠本地相关性门禁
+    base: https://external-api.kalshi.com/trade-api/v2
+    max_close_days: 400    # 成交时间窗口总跨度（天）：天然排除串关与超长周期盘
+    per_page: 500          # 单页拉取上限（Kalshi 上限 1000）
+    near_horizon_days: 60  # 近端范围（天）：宏观盘集中在这里，窗口切细才不会翻页翻不到
+    near_segment_days: 7   # 近端分段粒度（天）
+    far_segment_days: 30   # 远端分段粒度（天）
+    max_pages_per_segment: 4  # 每段最多翻页数（控请求量）
+
+signals:
+  # Kalshi 区间换手率 = 本次真实成交合约增量 / 当前未平仓合约数；0.10 = 10%
+  # 与动态放量倍数同时满足才报 volume_spike；缺失/零持仓时不报
+  kalshi_min_interval_turnover: 0.10
+  # 聪明钱 / 异动阈值
+  volume_multiple: 3.0          # 累计成交额 > N × 全场均值 → 放量
+  volume_24h_share: 0.08        # 24h 成交 / 累计成交 超过此值 → 资金正在涌入
+  prob_change_24h_pts: 5.0      # 24h 概率变动（百分点）→ 重定价
+  prob_change_7d_pts: 10.0      # 7d 概率变动（百分点）→ 中期趋势
+  prob_spike_pts: 15.0          # 相邻快照概率跳变（百分点）→ 概率异动
+  concentration_top1_pct: 45.0  # 最大单一钱包占可见头部持仓比例 → 巨鲸主导
+  cross_platform_divergence_pts: 10.0  # 跨平台同事件概率背离（百分点）
+  similarity_cutoff: 0.62       # 文本降级模式的标题模糊匹配阈值
+  # 跨平台配对优先用 embedding 语义匹配（复用 DASHSCOPE_API_KEY），无密钥/失败自动降级文本
+  use_embedding: true
+  embedding_cutoff: 0.80        # 余弦相似度配对阈值（看报告里 match_method 实跑后校准）
+  shape_mismatch_penalty: 0.05  # 仅兼容旧配置；不同形态现在直接拒配
+
+storage:
+  sqlite_path: data/snapshots.db   # 概率/成交量历史快照
+
+agent:
+  enabled: true
+  model: qwen-plus
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # 跨平台配对用的向量模型（同 base_url/密钥，OpenAI 兼容 /embeddings）
+  embed_model: text-embedding-v3
+  temperature: 0.1
+  max_tokens: 900
+  # 最多送 N 个高置信异动进 LLM 判断层（控成本）
+  max_events: 8
+  # 每个平台至少保底 N 个名额进 Agent（防止 high 全被 Polymarket 占据）
+  min_per_platform: 2
+  # 同一事件的互斥合约（Fed 阶梯/Iran 候选人系列）最多进 Agent 几个（0=不去重）
+  per_event_max: 1
+
+output:
+  dir: output
+  formats: [json, markdown]
